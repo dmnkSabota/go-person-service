@@ -1,6 +1,8 @@
 package models
 
 import (
+	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -35,6 +37,20 @@ type ErrorResponse struct {
 	Error string `json:"error"`
 }
 
+func (r *SavePersonRequest) Validate() error {
+	name := strings.TrimSpace(r.Name)
+	if len(name) == 0 {
+		return errors.New("name cannot be empty")
+	}
+	if len(r.Name) > 100 {
+		return errors.New("name cannot exceed 100 characters")
+	}
+	if r.DateOfBirth.After(time.Now()) {
+		return errors.New("date of birth cannot be in the future")
+	}
+	return nil
+}
+
 func (p *Person) BeforeCreate(*gorm.DB) error {
 	if p.ExternalID == uuid.Nil {
 		p.ExternalID = uuid.New()
@@ -54,7 +70,7 @@ func (p *Person) ToResponse() PersonResponse {
 func FromSaveRequest(req SavePersonRequest) Person {
 	return Person{
 		ExternalID:  req.ExternalID,
-		Name:        req.Name,
+		Name:        strings.TrimSpace(req.Name),
 		Email:       req.Email,
 		DateOfBirth: req.DateOfBirth,
 	}

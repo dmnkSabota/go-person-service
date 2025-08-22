@@ -39,4 +39,4 @@ go test ./tests/
 - `database/` - DB connection
 - `tests/` - Integration tests
 
-Uses Gin, GORM, PostgreSQL. External ID prevents duplicates.
+Uses Gin, GORM, PostgreSQL. External ID prevents duplicates. Basic validation for names and dates.

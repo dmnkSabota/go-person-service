@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"errors"
+	"log"
 	"net/http"
 	"person-service/models"
 	"strconv"
@@ -28,6 +29,13 @@ func (h *PersonHandler) SavePerson(c *gin.Context) {
 		return
 	}
 
+	if err := req.Validate(); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{
+			Error: "Validation error: " + err.Error(),
+		})
+		return
+	}
+
 	var existingPerson models.Person
 	if err := h.db.Where("external_id = ?", req.ExternalID).First(&existingPerson).Error; err == nil {
 		c.JSON(http.StatusConflict, models.ErrorResponse{
@@ -39,12 +47,14 @@ func (h *PersonHandler) SavePerson(c *gin.Context) {
 	person := models.FromSaveRequest(req)
 
 	if err := h.db.Create(&person).Error; err != nil {
+		log.Printf("Failed to create person: %v", err)
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
 			Error: "Failed to save person",
 		})
 		return
 	}
 
+	log.Printf("Created person with ID: %d, ExternalID: %s", person.ID, person.ExternalID)
 	c.JSON(http.StatusCreated, person.ToResponse())
 }
 
@@ -66,6 +76,7 @@ func (h *PersonHandler) GetPerson(c *gin.Context) {
 			})
 			return
 		}
+		log.Printf("Database error retrieving person ID %d: %v", id, err)
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
 			Error: "Failed to retrieve person",
 		})
