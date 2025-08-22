@@ -2,6 +2,7 @@ package tests
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -16,52 +17,101 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/testcontainers/testcontainers-go"
+	postgresContainer "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
 var (
-	router *gin.Engine
-	db     *gorm.DB
+	router    *gin.Engine
+	db        *gorm.DB
+	container *postgresContainer.PostgresContainer
+	ctx       context.Context
 )
 
 func TestMain(m *testing.M) {
-	if shouldSkipTests() {
-		fmt.Println("Skipping tests - PostgreSQL not available")
-		fmt.Println("To run tests, start PostgreSQL with: docker-compose up -d postgres")
+	ctx = context.Background()
+
+	if !isDockerAvailable() {
+		fmt.Println("Skipping tests - Docker not available")
+		fmt.Println("Install Docker to run integration tests")
 		os.Exit(0)
 	}
 
-	setup()
+	if err := setupTestContainer(); err != nil {
+		fmt.Printf("Failed to setup test container: %v\n", err)
+		os.Exit(1)
+	}
+
 	code := m.Run()
+
 	teardown()
 	os.Exit(code)
 }
 
-func shouldSkipTests() bool {
-	dbURL := "postgres://user:password@localhost:5432/persons?sslmode=disable"
-	db, err := gorm.Open(postgres.Open(dbURL), &gorm.Config{})
-	if err != nil {
-		return true
+func isDockerAvailable() bool {
+	testCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req := testcontainers.ContainerRequest{
+		Image:      "hello-world",
+		WaitingFor: wait.ForExit(),
 	}
 
-	sqlDB, _ := db.DB()
-	sqlDB.Close()
-	return false
+	container, err := testcontainers.GenericContainer(testCtx, testcontainers.GenericContainerRequest{
+		ContainerRequest: req,
+		Started:          false,
+	})
+
+	if err != nil {
+		return false
+	}
+
+	defer func() {
+		if container != nil {
+			err := container.Terminate(testCtx)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	return true
 }
 
-func setup() {
+func setupTestContainer() error {
 	gin.SetMode(gin.TestMode)
 
-	dbURL := "postgres://user:password@localhost:5432/persons?sslmode=disable"
 	var err error
-	db, err = gorm.Open(postgres.Open(dbURL), &gorm.Config{})
+	container, err = postgresContainer.RunContainer(ctx,
+		testcontainers.WithImage("postgres:15-alpine"),
+		postgresContainer.WithDatabase("persons_test"),
+		postgresContainer.WithUsername("testuser"),
+		postgresContainer.WithPassword("testpass"),
+		testcontainers.WithWaitStrategy(
+			wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2).
+				WithStartupTimeout(60*time.Second),
+		),
+	)
 	if err != nil {
-		panic("Failed to connect to test database: " + err.Error())
+		return fmt.Errorf("failed to start postgres container: %w", err)
+	}
+
+	connStr, err := container.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		return fmt.Errorf("failed to get connection string: %w", err)
+	}
+
+	db, err = gorm.Open(postgres.Open(connStr), &gorm.Config{})
+	if err != nil {
+		return fmt.Errorf("failed to connect to test database: %w", err)
 	}
 
 	if err := db.AutoMigrate(&models.Person{}); err != nil {
-		panic("Failed to migrate test database: " + err.Error())
+		return fmt.Errorf("failed to migrate test database: %w", err)
 	}
 
 	personHandler := handlers.NewPersonHandler(db)
@@ -71,11 +121,15 @@ func setup() {
 	})
 	router.POST("/save", personHandler.SavePerson)
 	router.GET("/:id", personHandler.GetPerson)
+
+	return nil
 }
 
 func teardown() {
-	if db != nil {
-		cleanTestData()
+	if container != nil {
+		if err := container.Terminate(ctx); err != nil {
+			fmt.Printf("Failed to terminate container: %v\n", err)
+		}
 	}
 }
 
@@ -212,4 +266,56 @@ func TestGetPersonInvalidID(t *testing.T) {
 	err := json.Unmarshal(w.Body.Bytes(), &errorResponse)
 	require.NoError(t, err)
 	assert.Equal(t, "Invalid ID format", errorResponse.Error)
+}
+
+func TestSavePersonInvalidEmail(t *testing.T) {
+	cleanTestData()
+
+	externalID := uuid.New()
+	reqBody := models.SavePersonRequest{
+		ExternalID:  externalID,
+		Name:        "Test User",
+		Email:       "invalid-email",
+		DateOfBirth: time.Date(1990, 1, 1, 12, 0, 0, 0, time.UTC),
+	}
+
+	jsonBody, err := json.Marshal(reqBody)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest("POST", "/save", bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+
+	var errorResponse models.ErrorResponse
+	err = json.Unmarshal(w.Body.Bytes(), &errorResponse)
+	require.NoError(t, err)
+	assert.Contains(t, errorResponse.Error, "Invalid request")
+}
+
+func TestSavePersonMissingFields(t *testing.T) {
+	cleanTestData()
+
+	reqBody := map[string]interface{}{
+		"external_id":   uuid.New(),
+		"email":         "test@example.com",
+		"date_of_birth": "1990-01-01T12:00:00Z",
+	}
+
+	jsonBody, err := json.Marshal(reqBody)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest("POST", "/save", bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+
+	var errorResponse models.ErrorResponse
+	err = json.Unmarshal(w.Body.Bytes(), &errorResponse)
+	require.NoError(t, err)
+	assert.Contains(t, errorResponse.Error, "Invalid request")
 }
